@@ -1,15 +1,29 @@
 import os
+import logging
 from pymongo import MongoClient
+
+logger = logging.getLogger("uvicorn.error")
 
 MONGO_URI = os.getenv("MONGO_URL") or os.getenv("MONGO_URI", "mongodb://localhost:27017")
 DB_NAME = os.getenv("DB_NAME", "meetmind_ai")
+print("MONGO_URL =", os.getenv("MONGO_URL"))
+print("MONGO_URI =", os.getenv("MONGO_URI"))
+print("FINAL_URI =", MONGO_URI)
+print("DB_NAME =", DB_NAME)
 
 _client = None
 
 def get_db():
     global _client
     if _client is None:
-        _client = MongoClient(MONGO_URI)
+        # Avoid hanging on Render if Atlas is unreachable or IP whitelist blocks Render
+        logger.info(f"Connecting to MongoDB at {MONGO_URI.split('@')[-1] if '@' in MONGO_URI else 'localhost'}...")
+        _client = MongoClient(
+            MONGO_URI,
+            serverSelectionTimeoutMS=5000,
+            connectTimeoutMS=5000,
+            socketTimeoutMS=10000
+        )
     return _client[DB_NAME]
 
 def get_classified_meetings_collection():

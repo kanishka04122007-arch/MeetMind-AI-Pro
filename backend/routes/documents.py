@@ -57,16 +57,19 @@ class ExtractResponse(BaseModel):
 def extract_text_from_pdf(file_path: str, force_ocr: bool = False) -> tuple[str, int, int, int]:
     """
     Extracts text, page count, word count, char count from a PDF file.
-    Uses pdfplumber first.
-    Requirement 1: If pdfplumber extracts less than 100 characters,
-    automatically switch to OCR mode (pdf2image + EasyOCR).
-    Requirement 9: Completely eliminates synthetic placeholder text.
+    Uses robust multi-tier fallback:
+      1. pdfplumber (layout-preserving text extraction)
+      2. pypdf (fast, robust text extraction)
+      3. pypdfium2 (Chromium engine, handles complex fonts without poppler)
+      4. Safe OCR fallback (only if ENABLE_HEAVY_OCR=true, guarded against Render OOM)
+    Guaranteed never to raise an unhandled exception or crash the server.
     """
     text_parts = []
     page_count = 0
     full_text = ""
 
     if not force_ocr:
+        # Tier 1: pdfplumber
         try:
             with pdfplumber.open(file_path) as pdf:
                 page_count = len(pdf.pages)
@@ -74,10 +77,11 @@ def extract_text_from_pdf(file_path: str, force_ocr: bool = False) -> tuple[str,
                     page_text = page.extract_text()
                     if page_text and page_text.strip():
                         text_parts.append(page_text.strip())
+            logger.info(f"pdfplumber extracted {len(text_parts)} page(s) with text from {file_path}")
         except Exception as e:
-            logger.warning(f"Warning reading PDF with pdfplumber: {e}")
+            logger.warning(f"pdfplumber extraction failed or not applicable: {e}")
 
-        # Fallback to pypdf if pdfplumber extracted nothing
+        # Tier 2: pypdf fallback
         if not text_parts or not "".join(text_parts).strip():
             try:
                 import pypdf
@@ -88,30 +92,57 @@ def extract_text_from_pdf(file_path: str, force_ocr: bool = False) -> tuple[str,
                     t = page.extract_text()
                     if t and t.strip():
                         text_parts.append(t.strip())
+                logger.info(f"pypdf fallback extracted {len(text_parts)} page(s) with text")
             except Exception as e2:
-                logger.warning(f"pypdf fallback failed: {e2}")
+                logger.warning(f"pypdf fallback extraction failed: {e2}")
+
+        # Tier 3: pypdfium2 fallback (lightweight Chromium PDF engine, handles tricky fonts)
+        if not text_parts or not "".join(text_parts).strip():
+            try:
+                import pypdfium2 as pdfium
+                pdf = pdfium.PdfDocument(file_path)
+                if page_count == 0:
+                    page_count = len(pdf)
+                for page in pdf:
+                    text_page = page.get_textpage()
+                    t = text_page.get_text_range()
+                    if t and t.strip():
+                        text_parts.append(t.strip())
+                logger.info(f"pypdfium2 fallback extracted {len(text_parts)} page(s) with text")
+            except Exception as e3:
+                logger.warning(f"pypdfium2 fallback extraction failed: {e3}")
 
         full_text = "\n\n".join(text_parts).strip()
 
-    # Requirement 1: If pdfplumber extracts less than 100 characters, automatically switch to OCR mode
-    if force_ocr or len(full_text) < 100 or is_placeholder_text(full_text):
-        logger.info(
-            f"PDF text is below 100 chars (len={len(full_text)}) or placeholder detected. "
-            f"Automatically switching to OCR mode using pdf2image and EasyOCR..."
-        )
-        try:
-            ocr_text, ocr_pages, ocr_words, ocr_chars = extract_ocr_from_pdf(file_path)
-            if ocr_text and len(ocr_text.strip()) > 0:
-                logger.info(f"OCR successfully extracted {ocr_words} words ({ocr_chars} chars) from {ocr_pages} pages.")
-                return ocr_text, ocr_pages, ocr_words, ocr_chars
-        except Exception as ocr_err:
-            logger.error(f"OCR extraction failed: {ocr_err}")
-            # If OCR fails, do NOT insert synthetic placeholder text (Requirement 9)
+    # Tier 4: OCR Fallback (strictly guarded by ENABLE_HEAVY_OCR to prevent 512MB RAM OOM crashes)
+    enable_heavy_ocr = os.getenv("ENABLE_HEAVY_OCR", "false").lower() in ("true", "1", "yes")
+    needs_ocr = force_ocr or len(full_text) < 100 or is_placeholder_text(full_text)
+
+    if needs_ocr:
+        if enable_heavy_ocr:
+            logger.info(
+                f"PDF text below 100 chars (len={len(full_text)}) and ENABLE_HEAVY_OCR=true. "
+                f"Attempting safe OCR extraction..."
+            )
+            try:
+                ocr_text, ocr_pages, ocr_words, ocr_chars = extract_ocr_from_pdf(file_path)
+                if ocr_text and len(ocr_text.strip()) > 0:
+                    logger.info(f"OCR successfully extracted {ocr_words} words ({ocr_chars} chars)")
+                    return ocr_text, max(page_count, ocr_pages), ocr_words, ocr_chars
+            except Exception as ocr_err:
+                logger.error(f"OCR extraction failed gracefully: {ocr_err}")
+        else:
+            logger.info(
+                f"PDF text is sparse (<100 chars, len={len(full_text)}). "
+                f"Heavy OCR skipped to protect Render 512MB RAM limits and prevent 502 Bad Gateway. "
+                f"Document will be saved with native extracted text."
+            )
 
     # Remove placeholder text if present
     if is_placeholder_text(full_text):
         full_text = ""
 
+    page_count = max(page_count, 1)
     words = full_text.split()
     return full_text, page_count, len(words), len(full_text)
 
@@ -121,39 +152,92 @@ async def upload_document(
     title: Optional[str] = Form(None),
     current_user_id: str = Depends(get_current_user_id)
 ):
+    """
+    Production-hardened PDF upload endpoint:
+    - Safe file size & format validation
+    - Multi-tier text extraction (pdfplumber -> pypdf -> pypdfium2 -> safe OCR)
+    - Granular MongoDB error handling with clear 503/500 diagnostic responses
+    - Structured logging for easy troubleshooting on Render
+    """
     user_id = str(current_user_id).strip()
+    logger.info(f"==> [UPLOAD] Incoming PDF upload request from user '{user_id}' for file: '{file.filename}'")
+
+    # 1. Validate file presence & extension
+    if not file or not file.filename:
+        logger.warning("[UPLOAD] Rejected: Missing file payload or filename.")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No file provided in the upload request."
+        )
 
     if not file.filename.lower().endswith(".pdf"):
+        logger.warning(f"[UPLOAD] Rejected non-PDF file: {file.filename}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Only PDF documents (.pdf) are allowed."
         )
 
-    file_content = await file.read()
-    file_size = len(file_content)
+    # 2. Read and validate file content & size
+    try:
+        file_content = await file.read()
+    except Exception as read_err:
+        logger.error(f"[UPLOAD] Failed to read uploaded file: {read_err}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Could not read uploaded file content: {str(read_err)}"
+        )
 
+    file_size = len(file_content)
+    if file_size == 0:
+        logger.warning("[UPLOAD] Rejected: Uploaded PDF is empty (0 bytes).")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The uploaded PDF file is empty (0 bytes)."
+        )
+
+    # Max 50 MB limit
+    if file_size > 50 * 1024 * 1024:
+        logger.warning(f"[UPLOAD] Rejected: File size {file_size} exceeds 50MB limit.")
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="PDF file exceeds the 50MB maximum upload limit."
+        )
+
+    # 3. Save file safely to disk
     safe_title = title.strip() if title and title.strip() else os.path.splitext(file.filename)[0]
     unique_suffix = uuid.uuid4().hex[:8]
-    stored_filename = f"{unique_suffix}_{file.filename}"
+    clean_base = os.path.basename(file.filename)
+    stored_filename = f"{unique_suffix}_{clean_base}"
     file_path = os.path.join(UPLOAD_DIR, stored_filename)
 
-    with open(file_path, "wb") as f:
-        f.write(file_content)
+    try:
+        with open(file_path, "wb") as f:
+            f.write(file_content)
+        logger.info(f"[UPLOAD] File successfully saved to disk: {file_path} ({file_size} bytes)")
+    except Exception as io_err:
+        logger.error(f"[UPLOAD] Disk write error at {file_path}: {io_err}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Server could not write file to storage: {str(io_err)}"
+        )
 
-    # Extract text (pdfplumber with auto-OCR fallback for < 100 chars)
+    # 4. Extract text safely (pdfplumber -> pypdf -> pypdfium2 -> safe OCR)
     try:
         extracted_text, page_count, word_count, char_count = extract_text_from_pdf(file_path)
-    except Exception as err:
+        logger.info(
+            f"[UPLOAD] Extraction complete: {page_count} page(s), "
+            f"{word_count} word(s), {char_count} char(s)"
+        )
+    except Exception as ext_err:
+        logger.error(f"[UPLOAD] Extraction encountered error, continuing with empty text: {ext_err}", exc_info=True)
         extracted_text = ""
         page_count = 1
         word_count = 0
         char_count = 0
-        logger.warning(f"Failed to auto-extract text from PDF: {err}")
 
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    # Record in 'documents' collection with user_id
-    docs_col = get_documents_collection()
+    # 5. Persist to MongoDB 'documents' collection with detailed error handling
     doc_record = {
         "user_id": user_id,
         "title": safe_title,
@@ -173,49 +257,79 @@ async def upload_document(
         "created_at": now_iso,
         "updated_at": now_iso
     }
-    insert_result = docs_col.insert_one(doc_record)
-    doc_id = str(insert_result.inserted_id)
 
-    # Record in 'files' collection with user_id
-    files_col = get_files_collection()
-    files_col.insert_one({
-        "_id": insert_result.inserted_id,
-        "id": doc_id,
-        "file_id": doc_id,
-        "fileName": file.filename,
-        "fileType": "pdf",
-        "status": "Completed",
-        "uploadedAt": now_iso,
-        "file_name": file.filename,
-        "file_type": "pdf",
-        "filename": file.filename,
-        "type": "pdf",
-        "title": safe_title,
-        "extracted_text": extracted_text,
-        "text": extracted_text,
-        "content": extracted_text,
-        "page_count": page_count,
-        "word_count": word_count,
-        "char_count": char_count,
-        "uploaded_at": now_iso,
-        "uploaded_by": user_id,
-        "user_id": user_id
-    })
+    try:
+        docs_col = get_documents_collection()
+        insert_result = docs_col.insert_one(doc_record)
+        doc_id = str(insert_result.inserted_id)
+        logger.info(f"[UPLOAD] Document saved in MongoDB 'documents' collection with ID: {doc_id}")
+    except Exception as db_err:
+        logger.error(f"[UPLOAD] MongoDB insert failed: {db_err}", exc_info=True)
+        err_type = type(db_err).__name__
+        err_msg = str(db_err)
+        if "Timeout" in err_type or "ServerSelection" in err_type or "timeout" in err_msg.lower():
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "Database connection timed out. Please check that MongoDB Atlas is reachable "
+                    "and that Network Access IP Access List allows 0.0.0.0/0 (required for Render deployments)."
+                )
+            )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database error while saving document: {err_msg}"
+        )
 
-    # Record in 'extracted_text' collection with user_id
-    if extracted_text:
-        extracted_col = get_extracted_text_collection()
-        extracted_col.insert_one({
-            "user_id": user_id,
-            "doc_id": doc_id,
+    # 6. Secondary record in 'files' collection (isolated so secondary issues do not fail upload)
+    try:
+        files_col = get_files_collection()
+        files_col.insert_one({
+            "_id": insert_result.inserted_id,
+            "id": doc_id,
             "file_id": doc_id,
             "fileName": file.filename,
+            "fileType": "pdf",
+            "status": "Completed",
+            "uploadedAt": now_iso,
+            "file_name": file.filename,
+            "file_type": "pdf",
+            "filename": file.filename,
+            "type": "pdf",
+            "title": safe_title,
+            "extracted_text": extracted_text,
             "text": extracted_text,
+            "content": extracted_text,
             "page_count": page_count,
             "word_count": word_count,
             "char_count": char_count,
-            "createdAt": now_iso
+            "uploaded_at": now_iso,
+            "uploaded_by": user_id,
+            "user_id": user_id
         })
+        logger.info(f"[UPLOAD] Synced record to 'files' collection.")
+    except Exception as f_err:
+        logger.warning(f"[UPLOAD] Secondary insert into 'files' failed (non-critical): {f_err}")
+
+    # 7. Secondary record in 'extracted_text' collection
+    if extracted_text:
+        try:
+            extracted_col = get_extracted_text_collection()
+            extracted_col.insert_one({
+                "user_id": user_id,
+                "doc_id": doc_id,
+                "file_id": doc_id,
+                "fileName": file.filename,
+                "text": extracted_text,
+                "page_count": page_count,
+                "word_count": word_count,
+                "char_count": char_count,
+                "createdAt": now_iso
+            })
+            logger.info(f"[UPLOAD] Synced record to 'extracted_text' collection.")
+        except Exception as e_err:
+            logger.warning(f"[UPLOAD] Secondary insert into 'extracted_text' failed (non-critical): {e_err}")
+
+    logger.info(f"<== [UPLOAD] Success! Document '{file.filename}' (ID: {doc_id}) ready for user '{user_id}'.")
 
     return PDFDocumentResponse(
         id=doc_id,
@@ -233,6 +347,7 @@ async def upload_document(
         created_at=now_iso,
         uploadDate=now_iso
     )
+
 
 @router.get("/latest", response_model=PDFDocumentResponse)
 def get_latest_document(current_user_id: str = Depends(get_current_user_id)):

@@ -1,7 +1,12 @@
 import os
+import logging
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, status
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+
+logger = logging.getLogger("uvicorn.error")
+
 
 load_dotenv(override=True)
 print("GROQ KEY:", os.getenv("GROQ_API_KEY"), flush=True)
@@ -18,14 +23,40 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Enable CORS for local development and production
+# CORS configuration supporting localhost:5174, localhost:5173, and Render domains
+allowed_origins = [
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "http://localhost:3000",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:5174",
+    "http://127.0.0.1:3000",
+    "https://meetmind-ai-pro.onrender.com",
+]
+
+frontend_url = os.getenv("FRONTEND_URL")
+if frontend_url:
+    clean_front = frontend_url.strip().rstrip("/")
+    if clean_front not in allowed_origins:
+        allowed_origins.append(clean_front)
+
+cors_origins_env = os.getenv("CORS_ORIGINS")
+if cors_origins_env:
+    for o in cors_origins_env.split(","):
+        clean_o = o.strip().rstrip("/")
+        if clean_o and clean_o not in allowed_origins:
+            allowed_origins.append(clean_o)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?|https://.*\.onrender\.com",
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
+
 
 # Register Routers
 app.include_router(
@@ -145,3 +176,21 @@ def read_root():
 @app.get("/api/health", tags=["Health Check"])
 def api_health():
     return {"status": "ok", "message": "MeetMind AI API is healthy and operational"}
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Global unhandled exception on {request.method} {request.url.path}: {exc}", exc_info=True)
+    origin = request.headers.get("origin", "*")
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "detail": f"Internal server error: {str(exc)}",
+            "type": type(exc).__name__,
+            "path": str(request.url.path)
+        },
+        headers={
+            "Access-Control-Allow-Origin": origin if origin else "*",
+            "Access-Control-Allow-Credentials": "true",
+        }
+    )
+

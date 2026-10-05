@@ -54,15 +54,20 @@ def get_poppler_path() -> Optional[str]:
 def get_easyocr_reader():
     """
     Lazily initializes and caches the EasyOCR Reader instance.
+    Guarded with try-except to prevent unhandled exceptions if PyTorch fails to load.
     """
     global _easyocr_reader
     if _easyocr_reader is None:
-        import easyocr
-        import torch
-        use_gpu = torch.cuda.is_available()
-        logger.info(f"Initializing EasyOCR Reader (gpu={use_gpu})...")
-        _easyocr_reader = easyocr.Reader(['en'], gpu=use_gpu, verbose=False)
-        logger.info("EasyOCR Reader ready.")
+        try:
+            import easyocr
+            import torch
+            use_gpu = torch.cuda.is_available()
+            logger.info(f"Initializing EasyOCR Reader (gpu={use_gpu})...")
+            _easyocr_reader = easyocr.Reader(['en'], gpu=use_gpu, verbose=False)
+            logger.info("EasyOCR Reader ready.")
+        except Exception as e:
+            logger.error(f"Failed to initialize EasyOCR Reader: {e}")
+            _easyocr_reader = None
     return _easyocr_reader
 
 def compute_file_sha256(file_path: str) -> str:
@@ -131,74 +136,106 @@ def extract_ocr_from_pdf(
     max_pages: Optional[int] = None
 ) -> Tuple[str, int, int, int]:
     """
-    Extracts text from a scanned PDF using pdf2image and EasyOCR.
-    Converts every PDF page to image, runs EasyOCR on all pages,
-    combines text from all pages, and caches the result.
+    Safely extracts text from a scanned PDF.
+    Guarded against Render OOM crashes (512MB RAM ceiling).
+    Uses pypdfium2 to render pages without requiring system poppler binaries.
     """
-    import numpy as np
-    import pdf2image
-
     if not os.path.exists(file_path):
-        raise FileNotFoundError(f"File not found: {file_path}")
+        logger.warning(f"File not found for OCR: {file_path}")
+        return "", 0, 0, 0
 
-    file_hash = compute_file_sha256(file_path)
+    # Check if heavy OCR is explicitly allowed
+    enable_heavy_ocr = os.getenv("ENABLE_HEAVY_OCR", "false").lower() in ("true", "1", "yes")
+    is_render = os.getenv("RENDER", "false").lower() in ("true", "1", "yes")
 
-    # 1. Check local OCR cache
-    cached = get_cached_ocr(file_hash)
-    if cached:
-        logger.info(f"Loaded OCR result from cache for {os.path.basename(file_path)} (hash: {file_hash[:8]})")
-        return (
-            cached["text"],
-            cached["page_count"],
-            cached["word_count"],
-            cached["char_count"]
+    if not enable_heavy_ocr:
+        reason = "Render 512MB RAM limit" if is_render else "ENABLE_HEAVY_OCR=false"
+        logger.info(
+            f"Heavy OCR (EasyOCR/PyTorch) is disabled ({reason}). "
+            f"Skipping OCR to prevent Out-Of-Memory (OOM) 502 crash. "
+            f"Document will be saved with native text."
         )
+        return "", 1, 0, 0
 
-    poppler_dir = get_poppler_path()
-
-    # 2. Convert every PDF page to image with pdf2image
-    logger.info(f"Converting PDF pages to images using pdf2image: {file_path}")
     try:
-        images = pdf2image.convert_from_path(
-            file_path,
-            poppler_path=poppler_dir,
-            dpi=72  # 72 dpi provides high OCR accuracy and speed
-        )
-    except Exception as e:
-        logger.error(f"Failed to convert PDF to images: {e}")
-        raise RuntimeError(f"pdf2image conversion failed: {e}")
+        file_hash = compute_file_sha256(file_path)
 
-    total_pages = len(images)
-    logger.info(f"Converted {total_pages} page(s) to images successfully.")
+        # 1. Check local OCR cache
+        cached = get_cached_ocr(file_hash)
+        if cached:
+            logger.info(f"Loaded OCR result from cache for {os.path.basename(file_path)} (hash: {file_hash[:8]})")
+            return (
+                cached["text"],
+                cached.get("page_count", 1),
+                cached.get("word_count", 0),
+                cached.get("char_count", 0)
+            )
 
-    if max_pages and max_pages > 0:
-        images_to_process = images[:max_pages]
-    else:
-        images_to_process = images
+        # 2. Render PDF pages to PIL images (prefer pypdfium2 over pdf2image to avoid poppler dependency)
+        images = []
+        total_pages = 1
 
-    # 3. Extract text using EasyOCR for every page
-    reader = get_easyocr_reader()
-    page_texts = []
-
-    for i, img in enumerate(images_to_process, start=1):
         try:
-            arr = np.array(img)
-            # Use paragraph=True and batch_size=8 for clean paragraph grouping and speed
-            res = reader.readtext(arr, detail=0, paragraph=True, batch_size=8)
-            clean_page = "\n".join(res).strip()
-            if clean_page:
-                page_texts.append(clean_page)
-            logger.info(f"OCR processed page {i}/{len(images_to_process)} ({len(clean_page)} chars)")
-        except Exception as e:
-            logger.warning(f"Error processing page {i} with EasyOCR: {e}")
+            import pypdfium2 as pdfium
+            pdf = pdfium.PdfDocument(file_path)
+            total_pages = len(pdf)
+            limit = min(total_pages, max_pages if max_pages and max_pages > 0 else 3)
+            for p_idx in range(limit):
+                page = pdf[p_idx]
+                pil_img = page.render(scale=1.0).to_pil()
+                images.append(pil_img)
+            logger.info(f"pypdfium2 rendered {len(images)} of {total_pages} page(s) to images.")
+        except Exception as p_err:
+            logger.warning(f"pypdfium2 rendering failed, attempting pdf2image fallback: {p_err}")
+            try:
+                import pdf2image
+                poppler_dir = get_poppler_path()
+                images = pdf2image.convert_from_path(
+                    file_path,
+                    poppler_path=poppler_dir,
+                    dpi=72,
+                    first_page=1,
+                    last_page=max_pages or 3
+                )
+                total_pages = len(images)
+            except Exception as pdf2img_err:
+                logger.warning(f"pdf2image fallback also failed: {pdf2img_err}")
+                return "", 1, 0, 0
 
-    # 4. Combine text from all pages
-    combined_text = "\n\n".join(page_texts).strip()
+        if not images:
+            return "", total_pages, 0, 0
 
-    word_count = len(combined_text.split()) if combined_text else 0
-    char_count = len(combined_text)
+        # 3. Extract text using EasyOCR for rendered pages
+        reader = get_easyocr_reader()
+        if reader is None:
+            logger.warning("EasyOCR Reader not available. Skipping OCR.")
+            return "", total_pages, 0, 0
 
-    # 5. Cache result
-    save_cached_ocr(file_hash, combined_text, total_pages, word_count, char_count)
+        import numpy as np
+        page_texts = []
+        for i, img in enumerate(images, start=1):
+            try:
+                arr = np.array(img)
+                res = reader.readtext(arr, detail=0, paragraph=True, batch_size=4)
+                clean_page = "\n".join(res).strip()
+                if clean_page:
+                    page_texts.append(clean_page)
+                logger.info(f"OCR processed page {i}/{len(images)} ({len(clean_page)} chars)")
+            except Exception as page_err:
+                logger.warning(f"Error processing page {i} with EasyOCR: {page_err}")
 
-    return combined_text, total_pages, word_count, char_count
+        # 4. Combine text from all pages
+        combined_text = "\n\n".join(page_texts).strip()
+        word_count = len(combined_text.split()) if combined_text else 0
+        char_count = len(combined_text)
+
+        # 5. Cache result
+        if combined_text:
+            save_cached_ocr(file_hash, combined_text, total_pages, word_count, char_count)
+
+        return combined_text, total_pages, word_count, char_count
+
+    except Exception as e:
+        logger.error(f"Unexpected error in extract_ocr_from_pdf: {e}", exc_info=True)
+        return "", 1, 0, 0
+

@@ -27,7 +27,7 @@ export function sanitizeToken(rawToken: any): string | null {
 // Base Axios API client
 // Note: Do not set default Content-Type to application/json so Axios can auto-set multipart boundaries
 export const api = axios.create({
-  baseURL: '', // Vite proxy forwards /api to backend
+  baseURL: import.meta.env.VITE_API_URL || '', // Routes /api requests to local backend (http://127.0.0.1:8000) via Vite proxy
 });
 
 // Interceptor to automatically attach Bearer token to all outgoing requests
