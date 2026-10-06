@@ -155,9 +155,17 @@ export const meetingsApi = {
       }
     }
 
+    const endpoint = `/api/meetings/${fileId}/transcribe`;
+    const fullUrl = `${api.defaults.baseURL || ''}${endpoint}`;
+    const requestBody = {};
+
+    console.log("[TRANSCRIBE DEBUG] meeting id:", fileId);
+    console.log("[TRANSCRIBE DEBUG] URL:", fullUrl);
+    console.log("[TRANSCRIBE DEBUG] request body:", requestBody);
+
     const response = await api.post<{ transcript_text: string; transcript?: string; duration?: number }>(
-      `/api/meetings/${fileId}/transcribe`,
-      {},
+      endpoint,
+      requestBody,
       { headers }
     );
     return response.data;

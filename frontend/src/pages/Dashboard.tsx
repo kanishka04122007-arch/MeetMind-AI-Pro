@@ -396,8 +396,9 @@ export const Dashboard: React.FC = () => {
       } catch {
         // ignore
       }
-    } catch {
-      setAudioErrorMsg('Unable to generate transcript. Please try again.');
+    } catch (err: any) {
+      console.error('[Dashboard] Transcribe failed:', err);
+      setAudioErrorMsg(err?.response?.data?.detail || err?.message || 'Unable to generate transcript. Please try again.');
     } finally {
       setTranscribingAudio(false);
     }

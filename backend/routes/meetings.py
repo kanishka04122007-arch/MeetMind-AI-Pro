@@ -7,6 +7,7 @@ from fastapi import APIRouter, UploadFile, File, Form, HTTPException, status, De
 from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from bson import ObjectId
+from groq import Groq
 
 from database import (
     get_db,
@@ -199,18 +200,6 @@ class TranscribeResponse(BaseModel):
     duration: Optional[float] = 0.0
     status: str = "completed"
 
-_whisper_model = None
-
-def get_whisper_model():
-    global _whisper_model
-    if _whisper_model is None:
-        try:
-            import whisper
-            _whisper_model = whisper.load_model("base")
-        except Exception as e:
-            logger.warning(f"Could not load Whisper model: {e}")
-            _whisper_model = None
-    return _whisper_model
 
 @router.post(
     "/{file_id}/transcribe",
@@ -223,6 +212,8 @@ async def transcribe_audio(
     file_id: str,
     current_user_id: str = Depends(get_current_user_id)
 ):
+    print("TRANSCRIBE ENDPOINT HIT", file_id, flush=True)
+    logger.info(f"TRANSCRIBE ENDPOINT HIT {file_id}")
     user_id = str(current_user_id).strip()
     user_match = {
         "$or": [
@@ -291,13 +282,31 @@ async def transcribe_audio(
     transcript_text = ""
     duration = 0.0
 
+    groq_api_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not groq_api_key:
+        logger.error("[TRANSCRIBE] GROQ_API_KEY environment variable is not configured.")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Transcription service is not configured. GROQ_API_KEY is missing."
+        )
+
     try:
-        model = get_whisper_model()
-        if model is not None:
-            transcribe_res = model.transcribe(physical_path, fp16=False)
-            transcript_text = transcribe_res.get("text", "").strip()
-    except Exception as whisper_err:
-        logger.error(f"Whisper transcription failed: {whisper_err}", exc_info=True)
+        client = Groq(api_key=groq_api_key)
+        with open(physical_path, "rb") as audio_file:
+            transcription = client.audio.transcriptions.create(
+                file=(os.path.basename(physical_path), audio_file.read()),
+                model="whisper-large-v3",
+                response_format="verbose_json"
+            )
+            transcript_text = transcription.text.strip()
+            duration = float(getattr(transcription, "duration", 0.0) or 0.0)
+            logger.info(f"[TRANSCRIBE] Groq transcription completed successfully ({len(transcript_text.split())} words, {duration:.1f}s)")
+    except Exception as groq_err:
+        logger.error(f"[TRANSCRIBE] Groq Whisper transcription failed: {groq_err}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Audio transcription failed via Groq API: {str(groq_err)}"
+        )
 
     # If audio contains no detected speech:
     if not transcript_text:

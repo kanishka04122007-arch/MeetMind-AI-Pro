@@ -1,4 +1,4 @@
-﻿annotated-doc==0.0.5
+annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1
 bcrypt==5.0.0
@@ -29,7 +29,7 @@ networkx==3.7
 ninja==1.13.2
 numba==0.68.0
 numpy==2.5.3
-openai-whisper==20250625
+groq>=0.9.0
 opencv-python-headless==5.0.0.93
 opentelemetry-api==1.45.0
 packaging==26.3
