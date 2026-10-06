@@ -273,6 +273,11 @@ async def transcribe_audio(
             if os.path.exists(candidate):
                 physical_path = candidate
 
+    print("1. file_doc:", file_doc, flush=True)
+    print("2. file_path:", file_path, flush=True)
+    print("3. physical_path:", physical_path, flush=True)
+    print("4. exists:", os.path.exists(physical_path) if physical_path else False, flush=True)
+
     if not physical_path or not os.path.exists(physical_path):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
