@@ -238,6 +238,7 @@ async def upload_document(
     now_iso = datetime.now(timezone.utc).isoformat()
 
     # 5. Persist to MongoDB 'documents' collection with detailed error handling
+    logger.info("STEP 1 REACHED")
     doc_record = {
         "user_id": user_id,
         "title": safe_title,
@@ -260,7 +261,9 @@ async def upload_document(
 
     try:
         docs_col = get_documents_collection()
+        logger.info("STEP 2 REACHED")
         insert_result = docs_col.insert_one(doc_record)
+        logger.info("STEP 3 REACHED")
         doc_id = str(insert_result.inserted_id)
         logger.info(f"[UPLOAD] Document saved in MongoDB 'documents' collection with ID: {doc_id}")
     except Exception as db_err:
