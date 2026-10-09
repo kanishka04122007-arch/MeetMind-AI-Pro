@@ -12,7 +12,7 @@ export interface HistoryMeetingItem {
   title: string;
   fileName: string;
   fileType: 'pdf' | 'audio';
-  sourceType: 'PDF Document' | 'Audio Meeting';
+  sourceType: 'PDF Document' | 'Audio Meeting' | 'Live Recording' | string;
   uploadDate: string;
   formattedDate: string;
   status: string;
@@ -30,6 +30,7 @@ export interface HistoryMeetingItem {
   wordCount?: number;
   pageCount?: number;
   duration?: number;
+  is_live_recording?: boolean;
 }
 
 export interface HistoryStats {

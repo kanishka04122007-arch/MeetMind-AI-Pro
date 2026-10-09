@@ -1,6 +1,7 @@
 import os
 import uuid
 import logging
+import subprocess
 from datetime import datetime, timezone
 from typing import Optional, List
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, status, Depends, Security
@@ -32,20 +33,41 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads", "audio")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-ALLOWED_AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".mp4"}
+ALLOWED_AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".mp4", ".webm", ".weba", ".ogg"}
 
 MIME_TYPE_MAPPING = {
     ".mp3": "audio/mpeg",
     ".wav": "audio/wav",
     ".m4a": "audio/x-m4a",
-    ".mp4": "video/mp4"
+    ".mp4": "video/mp4",
+    ".webm": "audio/webm",
+    ".weba": "audio/webm",
+    ".ogg": "audio/ogg"
 }
+
+def repair_wav_header_if_needed(data: bytes) -> bytes:
+    """
+    Detects and repairs reversed-endian WAV headers (e.g. 'FFIR', 'EVAW', ' tmf', 'atad')
+    produced by byte-swapped web audio writers.
+    """
+    if len(data) >= 44 and data[:4] == b"FFIR":
+        repaired = bytearray(data)
+        repaired[0:4] = b"RIFF"
+        if repaired[8:12] == b"EVAW":
+            repaired[8:12] = b"WAVE"
+        if repaired[12:16] == b" tmf":
+            repaired[12:16] = b"fmt "
+        if repaired[36:40] == b"atad":
+            repaired[36:40] = b"data"
+        return bytes(repaired)
+    return data
 
 class AudioUploadResponse(BaseModel):
     message: str = "Audio uploaded successfully"
     file_id: str
     filename: str
     status: str = "uploaded"
+    is_live: Optional[bool] = False
     # Backward compatibility fields for frontend UI:
     id: Optional[str] = None
     _id: Optional[str] = None
@@ -60,33 +82,35 @@ class MeetingAudioItemResponse(BaseModel):
     file_path: Optional[str] = None
     status: str = "uploaded"
     created_at: Optional[str] = None
+    is_live_recording: Optional[bool] = False
 
 @router.post(
     "/upload",
     response_model=AudioUploadResponse,
     status_code=status.HTTP_201_CREATED,
-    summary="Upload audio file and store metadata in MongoDB 'files' collection",
-    description="Accepts MP3, WAV, M4A, or MP4 file, saves physical file under backend/uploads/audio/, and stores metadata into MongoDB 'files' collection."
+    summary="Upload audio file (or live recording) and store metadata in MongoDB 'files' collection",
+    description="Accepts MP3, WAV, M4A, MP4, WebM, or OGG file, saves physical file under backend/uploads/audio/, and stores metadata into MongoDB 'files' collection."
 )
 async def upload_audio(
     file: UploadFile = File(...),
     title: Optional[str] = Form(None),
+    is_live: Optional[bool] = Form(False),
     current_user_id: str = Depends(get_current_user_id)
 ):
-    print("AUDIO UPLOAD STARTED", flush=True)
+    print(f"AUDIO UPLOAD STARTED (is_live={is_live})", flush=True)
 
     # Validate file extension
     _, ext = os.path.splitext(file.filename.lower())
     if ext not in ALLOWED_AUDIO_EXTENSIONS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unsupported file format '{ext}'. Only MP3, WAV, M4A, and MP4 are supported."
+            detail=f"Unsupported file format '{ext}'. Only MP3, WAV, M4A, MP4, WebM, and OGG are supported."
         )
 
     # Determine content-type / MIME
     content_type = file.content_type
     if not content_type or content_type == "application/octet-stream":
-        content_type = MIME_TYPE_MAPPING.get(ext, "audio/mpeg")
+        content_type = MIME_TYPE_MAPPING.get(ext, "audio/webm" if ext in {".webm", ".weba"} else "audio/mpeg")
 
     # Generate unique stored filename using UUID
     unique_stored_filename = f"{uuid.uuid4()}-{file.filename}"
@@ -118,6 +142,8 @@ async def upload_audio(
         "content_type": content_type,
         "file_path": relative_path,
         "status": "uploaded",
+        "is_live_recording": bool(is_live),
+        "source": "live_recording" if is_live else "upload",
         "created_at": now_iso,
         # Backward-compatibility fields:
         "fileName": file.filename,
@@ -141,10 +167,11 @@ async def upload_audio(
         )
 
     return AudioUploadResponse(
-        message="Audio uploaded successfully",
+        message="Live recording saved successfully" if is_live else "Audio uploaded successfully",
         file_id=inserted_id,
         filename=file.filename,
         status="uploaded",
+        is_live=bool(is_live),
         id=inserted_id,
         _id=inserted_id,
         fileName=file.filename,
@@ -173,8 +200,8 @@ def list_audio_files(current_user_id: str = Depends(get_current_user_id)):
                 "$or": [
                     {"file_type": "audio"},
                     {"fileType": "audio"},
-                    {"fileName": {"$regex": r"\.(mp3|wav|m4a|mp4)$", "$options": "i"}},
-                    {"filename": {"$regex": r"\.(mp3|wav|m4a|mp4)$", "$options": "i"}}
+                    {"fileName": {"$regex": r"\.(mp3|wav|m4a|mp4|webm|weba|ogg)$", "$options": "i"}},
+                    {"filename": {"$regex": r"\.(mp3|wav|m4a|mp4|webm|weba|ogg)$", "$options": "i"}}
                 ]
             }
         ]
@@ -188,7 +215,8 @@ def list_audio_files(current_user_id: str = Depends(get_current_user_id)):
             fileName=f.get("original_filename", f.get("fileName", "audio.mp3")),
             file_path=f.get("file_path", ""),
             status=f.get("status", "uploaded"),
-            created_at=f.get("created_at", f.get("uploadedAt", ""))
+            created_at=f.get("created_at", f.get("uploadedAt", "")),
+            is_live_recording=bool(f.get("is_live_recording", False))
         ))
     return results
 
@@ -297,15 +325,85 @@ async def transcribe_audio(
 
     try:
         client = Groq(api_key=groq_api_key)
+
+        # Read file bytes
         with open(physical_path, "rb") as audio_file:
-            transcription = client.audio.transcriptions.create(
-                file=(os.path.basename(physical_path), audio_file.read()),
-                model="whisper-large-v3",
-                response_format="verbose_json"
-            )
-            transcript_text = transcription.text.strip()
-            duration = float(getattr(transcription, "duration", 0.0) or 0.0)
-            logger.info(f"[TRANSCRIBE] Groq transcription completed successfully ({len(transcript_text.split())} words, {duration:.1f}s)")
+            raw_bytes = audio_file.read()
+
+        # Check for reversed-endian WAV headers ('FFIR', 'EVAW', ' tmf', 'atad') and repair if found
+        if len(raw_bytes) >= 44 and raw_bytes[:4] == b"FFIR":
+            repaired = bytearray(raw_bytes)
+            repaired[0:4] = b"RIFF"
+            if repaired[8:12] == b"EVAW":
+                repaired[8:12] = b"WAVE"
+            if repaired[12:16] == b" tmf":
+                repaired[12:16] = b"fmt "
+            if repaired[36:40] == b"atad":
+                repaired[36:40] = b"data"
+            raw_bytes = bytes(repaired)
+            logger.info(f"[TRANSCRIBE] Auto-repaired reversed WAV header for {physical_path}")
+            try:
+                with open(physical_path, "wb") as f_out:
+                    f_out.write(raw_bytes)
+            except Exception:
+                pass
+
+        transcription = None
+        last_error = None
+        whisper_models = ["whisper-large-v3", "whisper-large-v3-turbo"]
+
+        # Attempt 1: Transcribe directly using Groq Whisper models
+        for w_model in whisper_models:
+            try:
+                transcription = client.audio.transcriptions.create(
+                    file=(os.path.basename(physical_path), raw_bytes),
+                    model=w_model,
+                    response_format="verbose_json"
+                )
+                if transcription and getattr(transcription, "text", None) is not None:
+                    break
+            except Exception as w_err:
+                last_error = w_err
+                logger.warning(f"[TRANSCRIBE] Attempt with {w_model} failed: {w_err}")
+
+        # Attempt 2: If direct attempt failed (e.g. container or encoding issue), transcode with ffmpeg
+        if not transcription:
+            norm_path = None
+            try:
+                base, _ = os.path.splitext(physical_path)
+                norm_path = f"{base}_norm_{uuid.uuid4().hex[:6]}.mp3"
+                cmd = ["ffmpeg", "-y", "-i", physical_path, "-vn", "-ar", "16000", "-ac", "1", "-b:a", "64k", norm_path]
+                res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25)
+                if res.returncode == 0 and os.path.exists(norm_path) and os.path.getsize(norm_path) > 0:
+                    with open(norm_path, "rb") as nf:
+                        norm_bytes = nf.read()
+                    for w_model in whisper_models:
+                        try:
+                            transcription = client.audio.transcriptions.create(
+                                file=(os.path.basename(norm_path), norm_bytes),
+                                model=w_model,
+                                response_format="verbose_json"
+                            )
+                            if transcription and getattr(transcription, "text", None) is not None:
+                                logger.info(f"[TRANSCRIBE] Succeeded after FFmpeg normalization using {w_model}")
+                                break
+                        except Exception as nf_err:
+                            last_error = nf_err
+            except Exception as ffmpeg_err:
+                logger.warning(f"[TRANSCRIBE] FFmpeg transcoding attempt failed: {ffmpeg_err}")
+            finally:
+                if norm_path and os.path.exists(norm_path):
+                    try:
+                        os.remove(norm_path)
+                    except Exception:
+                        pass
+
+        if not transcription:
+            raise last_error or Exception("Audio transcription could not be completed.")
+
+        transcript_text = transcription.text.strip()
+        duration = float(getattr(transcription, "duration", 0.0) or 0.0)
+        logger.info(f"[TRANSCRIBE] Groq transcription completed successfully ({len(transcript_text.split())} words, {duration:.1f}s)")
     except Exception as groq_err:
         logger.error(f"[TRANSCRIBE] Groq Whisper transcription failed: {groq_err}", exc_info=True)
         raise HTTPException(
@@ -317,7 +415,7 @@ async def transcribe_audio(
     if not transcript_text:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No speech could be detected in the uploaded audio file."
+            detail="No speech could be detected in the uploaded audio file. Please speak clearly into your microphone and try again."
         )
 
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -336,12 +434,15 @@ async def transcribe_audio(
     # Record in 'transcripts' collection
     clean_user_id = str(user_id or file_doc.get("user_id") or "").strip()
     filename = file_doc.get("fileName") or file_doc.get("original_filename") or file_doc.get("filename") or "audio.mp3"
+    is_live_rec = bool(file_doc.get("is_live_recording", False))
     transcripts_col.insert_one({
         "file_id": file_id,
         "fileName": filename,
         "transcript": transcript_text,
         "createdAt": now_iso,
-        "user_id": clean_user_id
+        "user_id": clean_user_id,
+        "source_type": "audio",
+        "is_live_recording": is_live_rec
     })
 
     # Record/update in 'meetings' collection
@@ -356,6 +457,7 @@ async def transcribe_audio(
             "status": "completed",
             "transcript_text": transcript_text,
             "duration": duration,
+            "is_live_recording": is_live_rec,
             "updated_at": now_iso
         }},
         upsert=True

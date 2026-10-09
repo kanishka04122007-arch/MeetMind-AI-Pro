@@ -8,8 +8,12 @@ from fastapi.middleware.cors import CORSMiddleware
 logger = logging.getLogger("uvicorn.error")
 
 
-load_dotenv(override=True)
-print("GROQ KEY:", os.getenv("GROQ_API_KEY"), flush=True)
+env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+if os.path.exists(env_path):
+    load_dotenv(dotenv_path=env_path, override=True)
+else:
+    load_dotenv(override=True)
+print("GROQ KEY:", "SET" if os.getenv("GROQ_API_KEY") else "MISSING", flush=True)
 
 from routes.classifier import router as classifier_router
 from routes.auth import router as auth_router

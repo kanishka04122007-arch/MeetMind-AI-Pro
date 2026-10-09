@@ -6,7 +6,7 @@ import logging
 from typing import Optional
 from bson import ObjectId
 
-from services.classifier_service import classify_meeting_intelligence, SUPPORTED_CATEGORIES
+from services.classifier_service import classify_meeting_intelligence, extract_dynamic_keywords_from_text, SUPPORTED_CATEGORIES
 from database import get_classified_meetings_collection, get_classification_collection, get_summaries_collection, get_extracted_text_collection, get_transcripts_collection
 from services.jwt_auth import verify_and_decode_token, get_current_user_id, security
 
@@ -26,6 +26,7 @@ class MeetingResponse(BaseModel):
     confidence: int = Field(..., description="Dynamically calculated confidence percentage (e.g. 96)")
     reason: str = Field(..., description="Explanation why the category was selected")
     source: str = Field("Generated from current summary.", description="Attribution source")
+    keywords: list[str] = Field(default_factory=list, description="Keywords extracted directly from document content")
     id: Optional[str] = Field(None, description="MongoDB generated document ID")
     created_at: Optional[str] = Field(None, description="Timestamp when classification was recorded")
     title: Optional[str] = Field(None, description="Title of the classified document")
@@ -34,8 +35,8 @@ class MeetingResponse(BaseModel):
     "/classify",
     response_model=MeetingResponse,
     status_code=status.HTTP_200_OK,
-    summary="Classify and save meeting transcript with dynamic confidence and reason",
-    description="Analyzes summary or transcript using Groq NLP intelligence, predicts category, calculates confidence %, writes reason, and stores into MongoDB classification collection."
+    summary="Classify and save meeting transcript with dynamic confidence, reason, and keywords",
+    description="Analyzes summary or transcript using Groq NLP intelligence, predicts category, calculates confidence %, extracts real in-text keywords, and stores into MongoDB."
 )
 def classify(
     request: MeetingRequest,
@@ -88,9 +89,9 @@ def classify(
             detail="No document text, transcript, or summary available to classify. Please upload a PDF or Audio recording first."
         )
 
-    # Step 1: Run AI / NLP prediction to get category, dynamic confidence %, and explanatory reason
+    # Step 1: Run AI / NLP prediction to get category, dynamic confidence %, explanatory reason, and extracted keywords
     try:
-        category, confidence, reason = classify_meeting_intelligence(content, title=title)
+        category, confidence, reason, keywords = classify_meeting_intelligence(content, title=title)
     except Exception as err:
         logger.error(f"[classifier] Classification failed: {err}", exc_info=True)
         raise HTTPException(
@@ -105,6 +106,7 @@ def classify(
         "category": category,
         "confidence": confidence,
         "reason": reason,
+        "keywords": keywords,
         "source": source,
         "title": title or "Executive Document Session",
         "file_id": file_id,
@@ -125,9 +127,10 @@ def classify(
             "category": category,
             "confidence": confidence,
             "reason": reason,
+            "keywords": keywords,
             "created_at": created_at
         })
-        logger.info(f"[classifier] Saved classification record {inserted_id} into MongoDB for user {user_id}: {category} ({confidence}%)")
+        logger.info(f"[classifier] Saved classification record {inserted_id} into MongoDB for user {user_id}: {category} ({confidence}%) with keywords {keywords}")
     except Exception as db_err:
         logger.warning(f"[classifier] Could not persist classification to MongoDB: {db_err}")
 
@@ -136,6 +139,7 @@ def classify(
         confidence=confidence,
         reason=reason,
         source=source,
+        keywords=keywords,
         id=inserted_id,
         created_at=created_at,
         title=title or "Executive Document Session"
@@ -175,13 +179,29 @@ def get_latest_classification(current_user_id: str = Depends(get_current_user_id
             detail="No classification records found in database."
         )
 
+    cat = doc.get("category", "Educational")
+    reason = doc.get("reason", "")
+    content_text = doc.get("content_excerpt") or doc.get("transcript") or reason or ""
+
+    # Sanitize legacy/stale categories if needed
+    if cat.lower() in ["account", "billing", "shipping", "feedback"]:
+        if any(w in content_text.lower() for w in ["audio", "transcription", "system", "api", "code", "model", "features"]):
+            cat = "Technical"
+        else:
+            cat = "Team Discussion"
+
+    # Ensure genuine keywords exist
+    keywords = doc.get("keywords")
+    if not keywords or not isinstance(keywords, list) or len(keywords) == 0:
+        keywords = extract_dynamic_keywords_from_text(f"{content_text} {reason}", max_keywords=6)
+
     return MeetingResponse(
-        category=doc.get("category", "Educational"),
+        category=cat,
         confidence=int(doc.get("confidence", 95)),
-        reason=doc.get("reason", "Content classified based on detected course notes and technical keywords."),
+        reason=reason or f"Content categorized as {cat} based on topic analysis.",
         source=doc.get("source", "Generated from current summary."),
+        keywords=keywords,
         id=str(doc.get("_id", "")),
         created_at=doc.get("created_at"),
         title=doc.get("title")
     )
-

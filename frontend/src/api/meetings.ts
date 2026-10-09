@@ -28,6 +28,7 @@ export interface MeetingAudioItem {
   status: string;
   duration?: number;
   created_at?: string;
+  is_live_recording?: boolean;
 }
 
 export const meetingsApi = {
@@ -93,7 +94,7 @@ export const meetingsApi = {
   },
 
   // ================= AUDIO MODULE (Module 2.2 & 2.4) =================
-  async uploadAudio(file: File, title?: string): Promise<MeetingAudioItem> {
+  async uploadAudio(file: File, title?: string, isLive?: boolean): Promise<MeetingAudioItem> {
     // 3. Before audio upload, read token using:
     const token = localStorage.getItem("token");
 
@@ -128,6 +129,7 @@ export const meetingsApi = {
     const formData = new FormData();
     formData.append('file', file);
     if (title) formData.append('title', title);
+    if (isLive) formData.append('is_live', 'true');
 
     // 4. Send Authorization header exactly as: Authorization: Bearer <token>
     // 5. Remove any hardcoded token values
@@ -368,9 +370,11 @@ export interface ClassificationResult {
   confidence: number;
   reason: string;
   source: string;
+  keywords?: string[];
   id?: string;
   created_at?: string;
   title?: string;
 }
+
 
 

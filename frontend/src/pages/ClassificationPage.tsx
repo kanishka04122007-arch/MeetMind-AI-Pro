@@ -46,43 +46,142 @@ export const ClassificationPage: React.FC = () => {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [showInsightsModal, setShowInsightsModal] = useState<boolean>(false);
 
-  const getDetectedKeywords = (result: ClassificationResult | null, text: string): string[] => {
-    if (!result) return [];
-    if ((result as any).keywords && Array.isArray((result as any).keywords) && (result as any).keywords.length > 0) {
-      return (result as any).keywords;
-    }
+  const extractDynamicKeywords = (text: string): string[] => {
+    if (!text || !text.trim()) return [];
 
-    const categoryKeywords: Record<string, string[]> = {
-      'technical': ['Database', 'Normalization', 'SQL', 'Transaction', 'Architecture', 'Endpoints'],
-      'educational': ['Syllabus', 'Curriculum', 'Lecture', 'Assignment', 'Exam Prep', 'Module'],
-      'project review': ['Sprint', 'Roadmap', 'Milestones', 'Deliverables', 'Blockers', 'Timeline'],
-      'research discussion': ['Methodology', 'Empirical Study', 'Algorithm', 'Benchmark', 'Analysis'],
-      'business meeting': ['Strategy', 'KPIs', 'Revenue', 'Market Analysis', 'Operations'],
-      'client discussion': ['Requirements', 'Deliverables', 'Feedback', 'Contract', 'Timeline'],
-      'training session': ['Workshop', 'Hands-on', 'Tutorial', 'Onboarding', 'Best Practices'],
-      'academic seminar': ['Colloquium', 'Research Paper', 'Keynote', 'Symposium', 'Faculty'],
-      'product planning': ['Wireframing', 'Backlog', 'User Stories', 'Feature Scope', 'Roadmap'],
-    };
+    const lowerText = text.toLowerCase();
+    const stopWords = new Set([
+      'a', 'about', 'above', 'after', 'again', 'against', 'all', 'am', 'an', 'and', 'any', 'are',
+      'as', 'at', 'be', 'because', 'been', 'before', 'being', 'below', 'between', 'both', 'but',
+      'by', 'can', 'cannot', 'could', 'did', 'do', 'does', 'doing', 'down', 'during', 'each',
+      'few', 'for', 'from', 'further', 'had', 'has', 'have', 'having', 'he', 'her', 'here',
+      'hers', 'herself', 'him', 'himself', 'his', 'how', 'i', 'if', 'in', 'into', 'is', 'it',
+      'its', 'itself', 'just', 'me', 'more', 'most', 'my', 'myself', 'no', 'nor', 'not', 'of',
+      'off', 'on', 'once', 'only', 'or', 'other', 'our', 'ours', 'ourselves', 'out', 'over',
+      'own', 'same', 'she', 'should', 'so', 'some', 'such', 'than', 'that', 'the', 'their',
+      'theirs', 'them', 'themselves', 'then', 'there', 'these', 'they', 'this', 'those',
+      'through', 'to', 'too', 'under', 'until', 'up', 'very', 'was', 'we', 'were', 'what',
+      'when', 'where', 'which', 'while', 'who', 'whom', 'why', 'with', 'you', 'your', 'yours',
+      'will', 'shall', 'may', 'might', 'must', 'also', 'etc', 'well', 'session', 'meeting',
+      'pause', 'include', 'includes', 'goal', 'point', 'points', 'items', 'item', 'across', 'focusing'
+    ]);
 
-    const catKey = (result.category || '').toLowerCase();
-    let defaultList: string[] = ['Database', 'Normalization', 'SQL', 'Transaction'];
-    for (const [k, v] of Object.entries(categoryKeywords)) {
-      if (catKey.includes(k)) {
-        defaultList = v;
-        break;
+    const candidates: string[] = [];
+
+    // 1. Markdown bullet items (e.g. • Testing of the assistant's core features)
+    const bulletRegex = /[•\*\-]\s*([^\n\r•\*\-]+)/g;
+    let match;
+    while ((match = bulletRegex.exec(text)) !== null) {
+      const phrase = match[1].trim().replace(/[.,;:]+$/, '');
+      const words = phrase.split(/\s+/).filter((w) => !stopWords.has(w.toLowerCase()));
+      if (words.length >= 1 && words.length <= 4 && phrase.length >= 4 && phrase.length <= 40) {
+        if (lowerText.includes(phrase.toLowerCase())) {
+          candidates.push(phrase);
+        }
       }
     }
 
-    const combined = `${result.reason || ''} ${text || ''}`.toLowerCase();
-    const detected: string[] = [];
-    defaultList.forEach((w) => {
-      if (combined.includes(w.toLowerCase())) {
-        detected.push(w);
+    // 2. Section headers or bold phrases
+    const headerRegex = /(?:###|\*\*|##)\s*([^\n\r\*#]+)/g;
+    while ((match = headerRegex.exec(text)) !== null) {
+      const phrase = match[1].replace(/^\d+[\.\)]\s*/, '').trim().replace(/[.,;:]+$/, '');
+      const words = phrase.split(/\s+/).filter((w) => !stopWords.has(w.toLowerCase()));
+      if (words.length >= 1 && words.length <= 4 && phrase.length >= 4 && phrase.length <= 40) {
+        if (lowerText.includes(phrase.toLowerCase())) {
+          candidates.push(phrase);
+        }
       }
+    }
+
+    // 3. Consecutive non-stopword bigrams from text
+    const tokens = text.match(/[a-zA-Z0-9_\-]+/g) || [];
+    for (let i = 0; i < tokens.length - 1; i++) {
+      const w1 = tokens[i].trim();
+      const w2 = tokens[i + 1].trim();
+      if (w1.length > 2 && w2.length > 2 && !stopWords.has(w1.toLowerCase()) && !stopWords.has(w2.toLowerCase())) {
+        const phrase = `${w1} ${w2}`;
+        if (lowerText.includes(phrase.toLowerCase())) {
+          candidates.push(phrase);
+        }
+      }
+    }
+
+    // 4. Frequent individual words
+    const freq: Record<string, number> = {};
+    for (const tok of tokens) {
+      const clean = tok.trim();
+      if (clean.length >= 4 && !stopWords.has(clean.toLowerCase())) {
+        const cap = clean.charAt(0).toUpperCase() + clean.slice(1).toLowerCase();
+        freq[cap] = (freq[cap] || 0) + 1;
+      }
+    }
+
+    const sortedWords = Object.entries(freq).sort((a, b) => b[1] - a[1]);
+    for (const [w] of sortedWords.slice(0, 12)) {
+      if (lowerText.includes(w.toLowerCase())) {
+        candidates.push(w);
+      }
+    }
+
+    // Clean, format to Title Case, deduplicate, and strictly check presence in lowerText
+    const toTitleCase = (str: string) =>
+      str.replace(/\w\S*/g, (txt) => txt.charAt(0).toUpperCase() + txt.substring(1).toLowerCase());
+
+    candidates.sort((a, b) => {
+      const aWords = a.split(/\s+/).length;
+      const bWords = b.split(/\s+/).length;
+      if (aWords !== bWords) return bWords - aWords;
+      return b.length - a.length;
     });
 
-    return detected.length >= 2 ? detected : defaultList.slice(0, 4);
+    const seen = new Set<string>();
+    const results: string[] = [];
+
+    for (const cand of candidates) {
+      const formatted = toTitleCase(cand.trim());
+      const lowerCand = formatted.toLowerCase();
+
+      // STRICT CHECK: The term MUST exist in lowerText!
+      if (lowerText.includes(lowerCand) && !seen.has(lowerCand) && formatted.length >= 3) {
+        if (formatted.split(/\s+/).length === 1 && results.some((r) => r.toLowerCase().includes(lowerCand))) {
+          continue;
+        }
+        seen.add(lowerCand);
+        results.push(formatted);
+        if (results.length >= 6) break;
+      }
+    }
+
+    return results;
   };
+
+  const getDetectedKeywords = (result: ClassificationResult | null, text: string): string[] => {
+    if (!result && !text) return [];
+
+    const fullSourceText = `${text || ''} ${result?.reason || ''}`.trim();
+    const lowerSource = fullSourceText.toLowerCase();
+
+    // 1. If backend/AI provided keywords, verify that each keyword strictly appears in the text
+    if (result?.keywords && Array.isArray(result.keywords) && result.keywords.length > 0) {
+      const valid = result.keywords
+        .map((k) => String(k).trim())
+        .filter((k) => k.length >= 3 && lowerSource.includes(k.toLowerCase()));
+
+      if (valid.length >= 3) {
+        return valid.slice(0, 6);
+      }
+      if (valid.length > 0) {
+        const extra = extractDynamicKeywords(fullSourceText).filter(
+          (k) => !valid.some((v) => v.toLowerCase() === k.toLowerCase())
+        );
+        return [...valid, ...extra].slice(0, 6);
+      }
+    }
+
+    // 2. Dynamic extraction directly from the actual source content
+    return extractDynamicKeywords(fullSourceText);
+  };
+
 
   const executeClassification = useCallback(async (
     textToClassify: string,
@@ -222,9 +321,14 @@ export const ClassificationPage: React.FC = () => {
         const parsed = JSON.parse(cachedClass);
         if (parsed?.userId && parsed.userId !== currentUserId) {
           localStorage.removeItem('meetmind_active_classification');
-        } else if (parsed.category && (!activeTitle || parsed.title === activeTitle)) {
-          setClassificationResult(parsed);
-          return;
+        } else if (parsed.category) {
+          // If cached category is legacy "Account" or missing keywords, clear stale item
+          if (parsed.category.toLowerCase() === 'account' || !parsed.keywords || parsed.keywords.length === 0) {
+            localStorage.removeItem('meetmind_active_classification');
+          } else if (!activeTitle || parsed.title === activeTitle) {
+            setClassificationResult(parsed);
+            return;
+          }
         }
       }
     } catch {

@@ -2,45 +2,55 @@ import pandas as pd
 import joblib
 
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
+from sklearn.naive_bayes import MultinomialNB
 
-# Load dataset
-df = pd.read_csv("datasets/customer_support_tickets.csv")
+# Load both datasets
+df1 = pd.read_csv("datasets/team_meeting.csv")
+df2 = pd.read_csv("datasets/meeting_dataset.csv")
 
-# Input and Target
-X = df["message"]
-y = df["category"]
+# Merge datasets
+df = pd.concat([df1, df2], ignore_index=True)
+
+# Remove empty rows
+df = df.dropna()
+
+# Remove duplicate rows
+df = df.drop_duplicates()
+
+print("Total Records:", len(df))
+print(df["label"].value_counts())
+
+# Features and labels
+X = df["text"]
+y = df["label"]
 
 # Convert text into vectors
-vectorizer = TfidfVectorizer(max_features=5000)
+vectorizer = TfidfVectorizer()
 
-X_vectorized = vectorizer.fit_transform(X)
+X_vector = vectorizer.fit_transform(X)
 
-# Split dataset
+# Split
 X_train, X_test, y_train, y_test = train_test_split(
-    X_vectorized,
+    X_vector,
     y,
     test_size=0.2,
     random_state=42
 )
 
-# Train model
-model = LogisticRegression(max_iter=1000)
+# Train
+model = MultinomialNB()
 
 model.fit(X_train, y_train)
 
-# Test accuracy
-predictions = model.predict(X_test)
+# Accuracy
+accuracy = model.score(X_test, y_test)
 
-accuracy = accuracy_score(y_test, predictions)
-
-print("Model Accuracy:", round(accuracy * 100, 2), "%")
+print(f"Accuracy: {accuracy:.2f}")
 
 # Save model
 joblib.dump(model, "models/model.pkl")
 joblib.dump(vectorizer, "models/vectorizer.pkl")
 
-print("model.pkl created successfully")
-print("vectorizer.pkl created successfully")
+print("Training Completed")
+print("Model Saved")

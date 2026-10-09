@@ -53,6 +53,7 @@ class HistoryMeetingItem(BaseModel):
     wordCount: int = 0
     pageCount: int = 0
     duration: float = 0.0
+    is_live_recording: bool = False
 
 class HistoryStats(BaseModel):
     totalMeetings: int
@@ -136,6 +137,7 @@ def build_consolidated_history(user_id: Optional[str] = None) -> List[Dict[str, 
         title = raw_title.strip()
         ftype = "pdf" if (f.get("fileType") == "pdf" or f.get("file_type") == "pdf" or fn.lower().endswith(".pdf")) else "audio"
         upload_date = f.get("created_at") or f.get("uploadedAt") or f.get("uploaded_at") or f.get("uploadDate") or ""
+        is_live = bool(f.get("is_live_recording") or f.get("source") == "live_recording")
 
         record = {
             "id": fid,
@@ -143,7 +145,7 @@ def build_consolidated_history(user_id: Optional[str] = None) -> List[Dict[str, 
             "title": title,
             "fileName": fn,
             "fileType": ftype,
-            "sourceType": "PDF Document" if ftype == "pdf" else "Audio Meeting",
+            "sourceType": "Live Recording" if is_live else ("PDF Document" if ftype == "pdf" else "Audio Meeting"),
             "uploadDate": upload_date,
             "formattedDate": format_meeting_datetime(upload_date),
             "status": f.get("status", "Completed"),
@@ -161,6 +163,7 @@ def build_consolidated_history(user_id: Optional[str] = None) -> List[Dict[str, 
             "wordCount": f.get("word_count", 0),
             "pageCount": f.get("page_count", 0),
             "duration": f.get("duration", 0.0),
+            "is_live_recording": is_live,
         }
         records_map[fid] = record
         ordered_ids.append(fid)
